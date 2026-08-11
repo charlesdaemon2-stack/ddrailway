@@ -21,13 +21,15 @@ const USER_AGENTS = [
 
 // Durum ve Metrikler
 let isRunning = false;
-let targetUrl = "";
+let targetUrls = ["https://google.com"];
 let concurrency = 10;
 let delay = 50;
 let timeoutMs = 3000;
+let durationMinutes = 0;
 let httpMethod = "GET";
 let enableUARotation = true;
 let intervalId = null;
+let autoStopTimeoutId = null;
 
 let metrics = {
     totalRequests: 0,
@@ -84,6 +86,10 @@ function stopCurrentTest() {
         clearInterval(intervalId);
         intervalId = null;
     }
+    if (autoStopTimeoutId) {
+        clearTimeout(autoStopTimeoutId);
+        autoStopTimeoutId = null;
+    }
     if (httpAgent) {
         try { httpAgent.destroy(); } catch (err) {}
     }
@@ -99,8 +105,14 @@ function getRandomUserAgent() {
     return USER_AGENTS[index];
 }
 
+function getRandomTargetUrl() {
+    if (!targetUrls || targetUrls.length === 0) return "https://google.com";
+    const index = Math.floor(Math.random() * targetUrls.length);
+    return targetUrls[index];
+}
+
 function sendRequest(urlStr) {
-    if (!isRunning) return;
+    if (!isRunning || !urlStr) return;
 
     metrics.activeRequests++;
     const startTime = Date.now();
@@ -203,21 +215,25 @@ function sendRequest(urlStr) {
 
 // API Endpoints
 app.get('/api/start', (req, res) => {
-    const url = req.query.url;
+    const rawUrls = req.query.urls || req.query.url || "";
+    const parsedUrls = rawUrls.split(/[\n,]+/).map(u => u.trim()).filter(u => u.length > 0);
+
+    if (parsedUrls.length === 0) return res.status(400).json({ error: "En az bir geçerli hedef URL gerekli!" });
+
     const reqConcurrency = parseInt(req.query.concurrency) || 10;
     const reqDelay = parseInt(req.query.delay) || 50;
     const reqTimeout = parseInt(req.query.timeout) || 3000;
+    const reqDuration = parseInt(req.query.duration) || 0;
     const reqMethod = (req.query.method || 'GET').toUpperCase();
     const reqUARotation = req.query.uaRotation === 'true';
 
-    if (!url) return res.status(400).json({ error: "Hedef URL gerekli!" });
-
     stopCurrentTest();
 
-    targetUrl = url;
+    targetUrls = parsedUrls;
     concurrency = reqConcurrency;
     delay = reqDelay;
     timeoutMs = reqTimeout;
+    durationMinutes = reqDuration > 0 ? reqDuration : 0;
     httpMethod = ['GET', 'HEAD', 'POST'].includes(reqMethod) ? reqMethod : 'GET';
     enableUARotation = reqUARotation;
     isRunning = true;
@@ -246,11 +262,20 @@ app.get('/api/start', (req, res) => {
             return;
         }
         for (let i = 0; i < concurrency; i++) {
-            sendRequest(targetUrl);
+            sendRequest(getRandomTargetUrl());
         }
     }, delay);
 
-    res.json({ message: "Test başlatıldı", targetUrl, concurrency, delay, timeoutMs, httpMethod, enableUARotation });
+    // Otomatik Durdurma Zamanlayıcısı (Dakika)
+    if (durationMinutes > 0) {
+        const autoStopMs = durationMinutes * 60 * 1000;
+        autoStopTimeoutId = setTimeout(() => {
+            console.log(`⏱️ Test belirlenen ${durationMinutes} dakikalık süre dolduğu için otomatik durduruldu.`);
+            stopCurrentTest();
+        }, autoStopMs);
+    }
+
+    res.json({ message: "Test başlatıldı", targetUrls, concurrency, delay, timeoutMs, durationMinutes, httpMethod, enableUARotation });
 });
 
 app.get('/api/stop', (req, res) => {
@@ -274,10 +299,11 @@ app.get('/api/status', (req, res) => {
 
     res.json({
         isRunning,
-        targetUrl,
+        targetUrls,
         concurrency,
         delay,
         timeoutMs,
+        durationMinutes,
         httpMethod,
         enableUARotation,
         durationSeconds: durationSec,
@@ -318,10 +344,10 @@ app.get('/', (req, res) => {
         
         .form-group { margin-bottom: 20px; }
         label { display: block; margin-bottom: 8px; font-size: 0.85rem; color: #94a3b8; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
-        input[type="url"], input[type="number"], select { width: 100%; padding: 12px 16px; background: #0f172a; border: 1px solid #334155; border-radius: 8px; color: #fff; font-size: 0.95rem; outline: none; transition: 0.2s; }
-        input:focus, select:focus { border-color: #38bdf8; box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.2); }
+        input[type="url"], input[type="number"], select, textarea { width: 100%; padding: 12px 16px; background: #0f172a; border: 1px solid #334155; border-radius: 8px; color: #fff; font-size: 0.95rem; outline: none; transition: 0.2s; resize: vertical; }
+        input:focus, select:focus, textarea:focus { border-color: #38bdf8; box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.2); }
         
-        .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; }
+        .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; }
         .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
         
         .checkbox-group { display: flex; align-items: center; gap: 10px; background: #0f172a; padding: 12px 16px; border-radius: 8px; border: 1px solid #334155; margin-top: 24px; cursor: pointer; }
@@ -357,13 +383,13 @@ app.get('/', (req, res) => {
         </div>
 
         <div class="form-group">
-            <label for="targetUrl">HEDEF WEB SİTESİ URL</label>
-            <input type="url" id="targetUrl" placeholder="https://hedef-site.com" value="https://google.com">
+            <label for="targetUrls">HEDEF WEB SİTELERİ / URL LİSTESİ (HER SATIRA BİR URL)</label>
+            <textarea id="targetUrls" rows="3" placeholder="https://hedef-site1.com&#10;https://hedef-site2.com/api">https://google.com</textarea>
         </div>
 
-        <div class="grid-3">
+        <div class="grid-4">
             <div class="form-group">
-                <label for="concurrency">EŞZAMANLI İSTEK (CONCURRENCY)</label>
+                <label for="concurrency">EŞZAMANLI İSTEK</label>
                 <input type="number" id="concurrency" value="10" min="1" max="500">
             </div>
             <div class="form-group">
@@ -371,8 +397,12 @@ app.get('/', (req, res) => {
                 <input type="number" id="delay" value="50" min="5" max="5000">
             </div>
             <div class="form-group">
-                <label for="timeout">ZAMAN AŞIMI (TIMEOUT MS)</label>
+                <label for="timeout">ZAMAN AŞIMI (MS)</label>
                 <input type="number" id="timeout" value="3000" min="100" max="30000">
+            </div>
+            <div class="form-group">
+                <label for="duration">TEST SÜRESİ (DK - 0=SINIRSIZ)</label>
+                <input type="number" id="duration" value="0" min="0" max="1440" placeholder="0 = Sınırsız">
             </div>
         </div>
 
@@ -524,17 +554,18 @@ app.get('/', (req, res) => {
         }
 
         async function startTest() {
-            const url = document.getElementById('targetUrl').value;
+            const urls = document.getElementById('targetUrls').value;
             const concurrency = document.getElementById('concurrency').value;
             const delay = document.getElementById('delay').value;
             const timeout = document.getElementById('timeout').value;
+            const duration = document.getElementById('duration').value;
             const method = document.getElementById('method').value;
             const uaRotation = document.getElementById('uaRotation').checked;
 
-            if (!url) return alert('Lütfen geçerli bir URL girin!');
+            if (!urls.trim()) return alert('Lütfen en az bir geçerli URL girin!');
 
             try {
-                const res = await fetch(\`/api/start?url=\${encodeURIComponent(url)}&concurrency=\${concurrency}&delay=\${delay}&timeout=\${timeout}&method=\${method}&uaRotation=\${uaRotation}\`);
+                const res = await fetch(\`/api/start?urls=\${encodeURIComponent(urls)}&concurrency=\${concurrency}&delay=\${delay}&timeout=\${timeout}&duration=\${duration}&method=\${method}&uaRotation=\${uaRotation}\`);
                 const data = await res.json();
                 if (res.ok) {
                     setRunningUI(true);
@@ -576,7 +607,12 @@ app.get('/', (req, res) => {
                 document.getElementById('statActive').innerText = data.metrics.activeRequests.toLocaleString();
                 document.getElementById('statSuccess').innerText = data.metrics.successfulRequests.toLocaleString();
                 document.getElementById('statFailed').innerText = data.metrics.failedRequests.toLocaleString();
-                document.getElementById('statDuration').innerText = (data.durationSeconds || 0) + 's';
+                
+                let durText = (data.durationSeconds || 0) + 's';
+                if (data.durationMinutes > 0) {
+                    durText += \` / \${data.durationMinutes}dk\`;
+                }
+                document.getElementById('statDuration').innerText = durText;
                 
                 if (data.system) {
                     document.getElementById('statRam').innerText = data.system.ramHeapMb + ' MB';
