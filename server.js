@@ -63,8 +63,18 @@ let httpAgent = null;
 let httpsAgent = null;
 
 function createAgents() {
-    httpAgent = new http.Agent({ keepAlive: true, maxSockets: 500 });
-    httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 500 });
+    httpAgent = new http.Agent({
+        keepAlive: true,
+        keepAliveMsecs: 3000,
+        maxSockets: 500,
+        maxFreeSockets: 256
+    });
+    httpsAgent = new https.Agent({
+        keepAlive: true,
+        keepAliveMsecs: 3000,
+        maxSockets: 500,
+        maxFreeSockets: 256
+    });
 }
 createAgents();
 
@@ -129,6 +139,7 @@ function sendRequest(urlStr) {
         let handled = false;
 
         const req = client.request(options, (res) => {
+            res.resume();
             res.on('data', (chunk) => {
                 if (chunk && chunk.length) {
                     metrics.totalBytes += chunk.length;
