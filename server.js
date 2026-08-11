@@ -11,6 +11,8 @@ app.use(express.json());
 // Durum ve Metrikler
 let isRunning = false;
 let targetUrl = "";
+let concurrency = 10;
+let delay = 50;
 let intervalId = null;
 
 let metrics = {
@@ -21,8 +23,28 @@ let metrics = {
     statusCodes: {}
 };
 
-const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 100 });
-const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 100 });
+let httpAgent = new http.Agent({ keepAlive: true, maxSockets: 100 });
+let httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 100 });
+
+function createAgents() {
+    httpAgent = new http.Agent({ keepAlive: true, maxSockets: 100 });
+    httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 100 });
+}
+
+function stopCurrentTest() {
+    isRunning = false;
+    if (intervalId) {
+        clearInterval(intervalId);
+        intervalId = null;
+    }
+    if (httpAgent) {
+        try { httpAgent.destroy(); } catch (err) {}
+    }
+    if (httpsAgent) {
+        try { httpsAgent.destroy(); } catch (err) {}
+    }
+    createAgents();
+}
 
 // Chrome Taklitli Gelişmiş İstek Fonksiyonu
 function sendRequest(urlStr) {
@@ -61,6 +83,7 @@ function sendRequest(urlStr) {
         const req = client.request(options, (res) => {
             res.on('data', () => {});
             res.on('end', () => {
+                if (!isRunning) return;
                 metrics.totalRequests++;
                 if (res.statusCode >= 200 && res.statusCode < 400) {
                     metrics.successfulRequests++;
@@ -72,12 +95,14 @@ function sendRequest(urlStr) {
         });
 
         req.on('error', () => {
+            if (!isRunning) return;
             metrics.totalRequests++;
             metrics.failedRequests++;
         });
 
         req.end();
     } catch (err) {
+        if (!isRunning) return;
         metrics.failedRequests++;
     }
 }
@@ -85,13 +110,16 @@ function sendRequest(urlStr) {
 // API Endpoints
 app.get('/api/start', (req, res) => {
     const url = req.query.url;
-    const concurrency = parseInt(req.query.concurrency) || 5;
-    const delay = parseInt(req.query.delay) || 50;
+    const reqConcurrency = parseInt(req.query.concurrency) || 5;
+    const reqDelay = parseInt(req.query.delay) || 50;
 
     if (!url) return res.status(400).json({ error: "Hedef URL gerekli!" });
-    if (isRunning) return res.status(400).json({ error: "Test zaten çalışıyor!" });
+
+    stopCurrentTest();
 
     targetUrl = url;
+    concurrency = reqConcurrency;
+    delay = reqDelay;
     isRunning = true;
     metrics = {
         totalRequests: 0,
@@ -102,6 +130,11 @@ app.get('/api/start', (req, res) => {
     };
 
     intervalId = setInterval(() => {
+        if (!isRunning) {
+            clearInterval(intervalId);
+            intervalId = null;
+            return;
+        }
         for (let i = 0; i < concurrency; i++) {
             sendRequest(targetUrl);
         }
@@ -111,11 +144,7 @@ app.get('/api/start', (req, res) => {
 });
 
 app.get('/api/stop', (req, res) => {
-    if (!isRunning) return res.status(400).json({ message: "Test çalışmıyor." });
-
-    isRunning = false;
-    if (intervalId) clearInterval(intervalId);
-
+    stopCurrentTest();
     const durationSec = metrics.startTime ? ((new Date() - metrics.startTime) / 1000).toFixed(2) : 0;
     res.json({ message: "Test durduruldu", durationSeconds: durationSec, metrics });
 });
@@ -127,6 +156,8 @@ app.get('/api/status', (req, res) => {
     res.json({
         isRunning,
         targetUrl,
+        concurrency,
+        delay,
         durationSeconds: durationSec,
         requestsPerSecond: reqPerSec,
         metrics
@@ -218,8 +249,10 @@ app.get('/', (req, res) => {
                 <div id="statSuccess" class="stat-val" style="color:#10b981">0</div>
             </div>
             <div class="stat-card">
-                <div class="stat-label">Hatalı</div>
-                <div id="statFailed" class="stat-val" style="color:#ef4444">0</div>
+                <div class="stat-card-failed">
+                    <div class="stat-label">Hatalı</div>
+                    <div id="statFailed" class="stat-val" style="color:#ef4444">0</div>
+                </div>
             </div>
         </div>
 
@@ -241,7 +274,10 @@ app.get('/', (req, res) => {
                 const data = await res.json();
                 if (res.ok) {
                     setRunningUI(true);
-                    updateInterval = setInterval(fetchStatus, 1000);
+                    if (!updateInterval) {
+                        updateInterval = setInterval(fetchStatus, 1000);
+                    }
+                    fetchStatus();
                 } else {
                     alert(data.error || 'Hata oluştu');
                 }
@@ -255,7 +291,10 @@ app.get('/', (req, res) => {
                 const res = await fetch('/api/stop');
                 await res.json();
                 setRunningUI(false);
-                if (updateInterval) clearInterval(updateInterval);
+                if (updateInterval) {
+                    clearInterval(updateInterval);
+                    updateInterval = null;
+                }
                 fetchStatus();
             } catch (err) {
                 alert('Durdururken hata oluştu!');
@@ -277,9 +316,24 @@ app.get('/', (req, res) => {
 
                 if (data.isRunning) {
                     setRunningUI(true);
-                } else if (!data.isRunning && updateInterval) {
+                    if (!updateInterval) {
+                        updateInterval = setInterval(fetchStatus, 1000);
+                    }
+                    if (data.targetUrl && !document.getElementById('targetUrl').getAttribute('data-user-edited')) {
+                        document.getElementById('targetUrl').value = data.targetUrl;
+                    }
+                    if (data.concurrency && !document.getElementById('concurrency').getAttribute('data-user-edited')) {
+                        document.getElementById('concurrency').value = data.concurrency;
+                    }
+                    if (data.delay && !document.getElementById('delay').getAttribute('data-user-edited')) {
+                        document.getElementById('delay').value = data.delay;
+                    }
+                } else {
                     setRunningUI(false);
-                    clearInterval(updateInterval);
+                    if (updateInterval) {
+                        clearInterval(updateInterval);
+                        updateInterval = null;
+                    }
                 }
             } catch (err) {}
         }
@@ -301,6 +355,15 @@ app.get('/', (req, res) => {
                 btnStop.disabled = true;
             }
         }
+
+        ['targetUrl', 'concurrency', 'delay'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) {
+                el.addEventListener('input', () => {
+                    el.setAttribute('data-user-edited', 'true');
+                });
+            }
+        });
 
         fetchStatus();
     </script>
