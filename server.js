@@ -207,6 +207,10 @@ app.get('/api/start', (req, res) => {
             intervalId = null;
             return;
         }
+        // Eğer havuzda halihazırda çok fazla yanıt bekleyen istek biriktiyse (örneğin 1000+), yenilerini yığma
+        if (metrics.activeRequests > concurrency * 10) {
+            return;
+        }
         for (let i = 0; i < concurrency; i++) {
             sendRequest(targetUrl);
         }
