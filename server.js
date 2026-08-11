@@ -37,9 +37,27 @@ let metrics = {
     totalLatencyMs: 0,
     minLatencyMs: null,
     maxLatencyMs: 0,
+    totalBytes: 0,
     startTime: null,
     statusCodes: {}
 };
+
+// CPU Kullanım Takibi Nesnesi
+let lastCpuUsage = process.cpuUsage();
+let lastCpuTime = Date.now();
+
+function getCpuPercent() {
+    const now = Date.now();
+    const timeDiffUs = (now - lastCpuTime) * 1000;
+    if (timeDiffUs <= 0) return 0;
+
+    const diff = process.cpuUsage(lastCpuUsage);
+    lastCpuUsage = process.cpuUsage();
+    lastCpuTime = now;
+
+    const totalUs = diff.user + diff.system;
+    return Math.min(100, Math.round((totalUs / timeDiffUs) * 100));
+}
 
 let httpAgent = null;
 let httpsAgent = null;
@@ -111,7 +129,11 @@ function sendRequest(urlStr) {
         let handled = false;
 
         const req = client.request(options, (res) => {
-            res.on('data', () => {});
+            res.on('data', (chunk) => {
+                if (chunk && chunk.length) {
+                    metrics.totalBytes += chunk.length;
+                }
+            });
             res.on('end', () => {
                 if (handled) return;
                 handled = true;
@@ -197,6 +219,7 @@ app.get('/api/start', (req, res) => {
         totalLatencyMs: 0,
         minLatencyMs: null,
         maxLatencyMs: 0,
+        totalBytes: 0,
         startTime: new Date(),
         statusCodes: {}
     };
@@ -233,6 +256,10 @@ app.get('/api/status', (req, res) => {
     const mem = process.memoryUsage();
     const ramHeapMb = (mem.heapUsed / 1024 / 1024).toFixed(1);
     const ramRssMb = (mem.rss / 1024 / 1024).toFixed(1);
+    const cpuPercent = getCpuPercent();
+
+    const totalMb = (metrics.totalBytes / 1024 / 1024).toFixed(2);
+    const networkMbps = durationSec > 0 ? ((metrics.totalBytes / 1024 / 1024) / durationSec).toFixed(2) : '0.00';
 
     res.json({
         isRunning,
@@ -247,7 +274,10 @@ app.get('/api/status', (req, res) => {
         avgLatencyMs: avgLatency,
         system: {
             ramHeapMb,
-            ramRssMb
+            ramRssMb,
+            cpuPercent,
+            totalMb,
+            networkMbps
         },
         metrics
     });
@@ -383,6 +413,18 @@ app.get('/', (req, res) => {
             <div class="stat-card">
                 <div class="stat-label">Sunucu RAM Kullanımı</div>
                 <div id="statRam" class="stat-val" style="color:#ec4899">0 MB</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Sunucu CPU Yükü</div>
+                <div id="statCpu" class="stat-val" style="color:#f97316">%0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Ağ Trafiği (Veri)</div>
+                <div id="statNet" class="stat-val" style="color:#06b6d4">0 MB</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Ağ Hızı (Mbps)</div>
+                <div id="statSpeed" class="stat-val" style="color:#6366f1">0 MB/s</div>
             </div>
             <div class="stat-card">
                 <div class="stat-label">Test Süresi</div>
@@ -527,6 +569,9 @@ app.get('/', (req, res) => {
                 
                 if (data.system) {
                     document.getElementById('statRam').innerText = data.system.ramHeapMb + ' MB';
+                    document.getElementById('statCpu').innerText = '%' + data.system.cpuPercent;
+                    document.getElementById('statNet').innerText = data.system.totalMb + ' MB';
+                    document.getElementById('statSpeed').innerText = data.system.networkMbps + ' MB/s';
                 }
 
                 // Grafik Güncelleme (Son 20 saniyelik zaman serisi)
