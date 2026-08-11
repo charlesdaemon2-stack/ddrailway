@@ -1,15 +1,12 @@
 {
   "name": "railway-ddos-bot",
   "version": "1.0.0",
-  "description": "Manuel URL ile çalışan basit DDOS botu",
+  "description": "Manuel URL ile çalışan basit bot",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.18.2",
-    "http": "^0.2.0",
-    "https": "^1.0.0",
-    "url": "^0.1.1"
+    "express": "^4.18.2"
   }
 }
