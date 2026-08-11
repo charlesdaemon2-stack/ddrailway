@@ -8,28 +8,47 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
 
+// Gerçekçi User-Agent Havuzu (Anti-Bot Bypass Rotasyonu)
+const USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2.1 Safari/605.1.15',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0',
+    'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1'
+];
+
 // Durum ve Metrikler
 let isRunning = false;
 let targetUrl = "";
 let concurrency = 10;
 let delay = 50;
+let timeoutMs = 3000;
+let httpMethod = "GET";
+let enableUARotation = true;
 let intervalId = null;
 
 let metrics = {
     totalRequests: 0,
     successfulRequests: 0,
     failedRequests: 0,
+    activeRequests: 0,
+    totalLatencyMs: 0,
+    minLatencyMs: null,
+    maxLatencyMs: 0,
     startTime: null,
     statusCodes: {}
 };
 
-let httpAgent = new http.Agent({ keepAlive: true, maxSockets: 100 });
-let httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 100 });
+let httpAgent = null;
+let httpsAgent = null;
 
 function createAgents() {
-    httpAgent = new http.Agent({ keepAlive: true, maxSockets: 100 });
-    httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 100 });
+    httpAgent = new http.Agent({ keepAlive: true, maxSockets: 500 });
+    httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 500 });
 }
+createAgents();
 
 function stopCurrentTest() {
     isRunning = false;
@@ -46,9 +65,17 @@ function stopCurrentTest() {
     createAgents();
 }
 
-// Chrome Taklitli Gelişmiş İstek Fonksiyonu
+function getRandomUserAgent() {
+    if (!enableUARotation) return USER_AGENTS[0];
+    const index = Math.floor(Math.random() * USER_AGENTS.length);
+    return USER_AGENTS[index];
+}
+
 function sendRequest(urlStr) {
     if (!isRunning) return;
+
+    metrics.activeRequests++;
+    const startTime = Date.now();
 
     try {
         const parsedUrl = new URL(urlStr);
@@ -60,10 +87,10 @@ function sendRequest(urlStr) {
             hostname: parsedUrl.hostname,
             port: parsedUrl.port || (isHttps ? 443 : 80),
             path: parsedUrl.pathname + parsedUrl.search,
-            method: 'GET',
+            method: httpMethod,
             agent: agent,
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+                'User-Agent': getRandomUserAgent(),
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
                 'Accept-Language': 'tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7',
                 'Accept-Encoding': 'gzip, deflate, br',
@@ -76,15 +103,27 @@ function sendRequest(urlStr) {
                 'sec-fetch-site': 'cross-site',
                 'sec-fetch-user': '?1',
                 'upgrade-insecure-requests': '1',
-                'Cache-Control': 'no-cache'
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive'
             }
         };
+
+        let handled = false;
 
         const req = client.request(options, (res) => {
             res.on('data', () => {});
             res.on('end', () => {
+                if (handled) return;
+                handled = true;
+                metrics.activeRequests = Math.max(0, metrics.activeRequests - 1);
                 if (!isRunning) return;
+
+                const latency = Date.now() - startTime;
                 metrics.totalRequests++;
+                metrics.totalLatencyMs += latency;
+                if (metrics.minLatencyMs === null || latency < metrics.minLatencyMs) metrics.minLatencyMs = latency;
+                if (latency > metrics.maxLatencyMs) metrics.maxLatencyMs = latency;
+
                 if (res.statusCode >= 200 && res.statusCode < 400) {
                     metrics.successfulRequests++;
                 } else {
@@ -94,24 +133,49 @@ function sendRequest(urlStr) {
             });
         });
 
-        req.on('error', () => {
+        // Yanıt vermeyen soketler için Zaman Aşımı (Timeout) Koruması
+        req.setTimeout(timeoutMs, () => {
+            if (handled) return;
+            handled = true;
+            req.destroy();
+            metrics.activeRequests = Math.max(0, metrics.activeRequests - 1);
             if (!isRunning) return;
+
             metrics.totalRequests++;
             metrics.failedRequests++;
+            metrics.statusCodes['Timeout (408)'] = (metrics.statusCodes['Timeout (408)'] || 0) + 1;
+        });
+
+        req.on('error', (err) => {
+            if (handled) return;
+            handled = true;
+            metrics.activeRequests = Math.max(0, metrics.activeRequests - 1);
+            if (!isRunning) return;
+
+            metrics.totalRequests++;
+            metrics.failedRequests++;
+            const errCode = err.code || 'Hata';
+            metrics.statusCodes[errCode] = (metrics.statusCodes[errCode] || 0) + 1;
         });
 
         req.end();
     } catch (err) {
+        metrics.activeRequests = Math.max(0, metrics.activeRequests - 1);
         if (!isRunning) return;
+        metrics.totalRequests++;
         metrics.failedRequests++;
+        metrics.statusCodes['Geçersiz URL'] = (metrics.statusCodes['Geçersiz URL'] || 0) + 1;
     }
 }
 
 // API Endpoints
 app.get('/api/start', (req, res) => {
     const url = req.query.url;
-    const reqConcurrency = parseInt(req.query.concurrency) || 5;
+    const reqConcurrency = parseInt(req.query.concurrency) || 10;
     const reqDelay = parseInt(req.query.delay) || 50;
+    const reqTimeout = parseInt(req.query.timeout) || 3000;
+    const reqMethod = (req.query.method || 'GET').toUpperCase();
+    const reqUARotation = req.query.uaRotation === 'true';
 
     if (!url) return res.status(400).json({ error: "Hedef URL gerekli!" });
 
@@ -120,11 +184,19 @@ app.get('/api/start', (req, res) => {
     targetUrl = url;
     concurrency = reqConcurrency;
     delay = reqDelay;
+    timeoutMs = reqTimeout;
+    httpMethod = ['GET', 'HEAD', 'POST'].includes(reqMethod) ? reqMethod : 'GET';
+    enableUARotation = reqUARotation;
     isRunning = true;
+
     metrics = {
         totalRequests: 0,
         successfulRequests: 0,
         failedRequests: 0,
+        activeRequests: 0,
+        totalLatencyMs: 0,
+        minLatencyMs: null,
+        maxLatencyMs: 0,
         startTime: new Date(),
         statusCodes: {}
     };
@@ -140,7 +212,7 @@ app.get('/api/start', (req, res) => {
         }
     }, delay);
 
-    res.json({ message: "Test başlatıldı", targetUrl, concurrency, delay });
+    res.json({ message: "Test başlatıldı", targetUrl, concurrency, delay, timeoutMs, httpMethod, enableUARotation });
 });
 
 app.get('/api/stop', (req, res) => {
@@ -152,14 +224,19 @@ app.get('/api/stop', (req, res) => {
 app.get('/api/status', (req, res) => {
     const durationSec = metrics.startTime && isRunning ? ((new Date() - metrics.startTime) / 1000).toFixed(2) : 0;
     const reqPerSec = durationSec > 0 ? (metrics.totalRequests / durationSec).toFixed(2) : 0;
+    const avgLatency = metrics.totalRequests > 0 ? Math.round(metrics.totalLatencyMs / metrics.totalRequests) : 0;
 
     res.json({
         isRunning,
         targetUrl,
         concurrency,
         delay,
+        timeoutMs,
+        httpMethod,
+        enableUARotation,
         durationSeconds: durationSec,
         requestsPerSecond: reqPerSec,
+        avgLatencyMs: avgLatency,
         metrics
     });
 });
@@ -172,24 +249,30 @@ app.get('/', (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Sunucu Yük Testi Kontrol Paneli</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <title>⚡ Gelişmiş Sunucu Yük Testi Kontrol Paneli</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', sans-serif; }
         body { background: #0f172a; color: #f8fafc; display: flex; justify-content: center; align-items: center; min-height: 100vh; padding: 20px; }
-        .container { background: #1e293b; width: 100%; max-width: 800px; padding: 30px; border-radius: 16px; box-shadow: 0 20px 25px -5px rgba(0,0,0,0.5); border: 1px solid #334155; }
+        .container { background: #1e293b; width: 100%; max-width: 900px; padding: 30px; border-radius: 16px; box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5); border: 1px solid #334155; }
         .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 25px; border-bottom: 1px solid #334155; padding-bottom: 15px; }
-        .title { font-size: 1.4rem; font-weight: 700; color: #38bdf8; }
-        .badge { padding: 6px 12px; border-radius: 20px; font-size: 0.85rem; font-weight: 600; text-transform: uppercase; }
-        .badge-idle { background: #475569; color: #cbd5e1; }
+        .title { font-size: 1.5rem; font-weight: 700; color: #38bdf8; display: flex; align-items: center; gap: 10px; }
+        .badge { padding: 6px 14px; border-radius: 20px; font-size: 0.85rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }
+        .badge-idle { background: #334155; color: #94a3b8; }
         .badge-running { background: #10b981; color: #022c22; animation: pulse 1.5s infinite; }
         @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
         
         .form-group { margin-bottom: 20px; }
-        label { display: block; margin-bottom: 8px; font-size: 0.85rem; color: #94a3b8; font-weight: 600; }
-        input[type="url"], input[type="number"] { width: 100%; padding: 12px 16px; background: #0f172a; border: 1px solid #334155; border-radius: 8px; color: #fff; font-size: 1rem; outline: none; transition: 0.2s; }
-        input:focus { border-color: #38bdf8; box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.2); }
+        label { display: block; margin-bottom: 8px; font-size: 0.85rem; color: #94a3b8; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+        input[type="url"], input[type="number"], select { width: 100%; padding: 12px 16px; background: #0f172a; border: 1px solid #334155; border-radius: 8px; color: #fff; font-size: 0.95rem; outline: none; transition: 0.2s; }
+        input:focus, select:focus { border-color: #38bdf8; box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.2); }
+        
+        .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; }
         .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
+        
+        .checkbox-group { display: flex; align-items: center; gap: 10px; background: #0f172a; padding: 12px 16px; border-radius: 8px; border: 1px solid #334155; margin-top: 24px; cursor: pointer; }
+        .checkbox-group input { width: 18px; height: 18px; cursor: pointer; accent-color: #38bdf8; }
+        .checkbox-group label { margin: 0; cursor: pointer; font-size: 0.9rem; text-transform: none; color: #e2e8f0; }
 
         .btn-group { display: flex; gap: 15px; margin-top: 25px; }
         button { flex: 1; padding: 14px; border: none; border-radius: 8px; font-size: 1rem; font-weight: 700; cursor: pointer; transition: 0.2s; }
@@ -197,14 +280,16 @@ app.get('/', (req, res) => {
         .btn-start:hover { background: #0369a1; }
         .btn-stop { background: #ef4444; color: white; }
         .btn-stop:hover { background: #dc2626; }
-        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        button:disabled { opacity: 0.4; cursor: not-allowed; }
 
-        .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin-top: 30px; }
-        .stat-card { background: #0f172a; padding: 15px; border-radius: 10px; border: 1px solid #334155; text-align: center; }
-        .stat-val { font-size: 1.4rem; font-weight: 700; color: #f8fafc; margin-top: 5px; }
-        .stat-label { font-size: 0.75rem; color: #64748b; text-transform: uppercase; letter-spacing: 0.5px; }
+        .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin-top: 30px; }
+        .stat-card { background: #0f172a; padding: 18px; border-radius: 10px; border: 1px solid #334155; text-align: center; }
+        .stat-val { font-size: 1.6rem; font-weight: 700; color: #f8fafc; margin-top: 6px; }
+        .stat-label { font-size: 0.75rem; color: #64748b; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }
         
-        .status-codes { margin-top: 20px; background: #0f172a; padding: 15px; border-radius: 8px; font-size: 0.85rem; color: #cbd5e1; }
+        .status-codes { margin-top: 20px; background: #0f172a; padding: 18px; border-radius: 10px; border: 1px solid #334155; font-size: 0.9rem; color: #cbd5e1; }
+        .status-codes-title { font-size: 0.85rem; font-weight: 700; text-transform: uppercase; color: #94a3b8; margin-bottom: 10px; letter-spacing: 0.5px; }
+        .code-pill { display: inline-block; background: #1e293b; border: 1px solid #334155; padding: 4px 10px; border-radius: 6px; margin-right: 8px; margin-bottom: 6px; font-size: 0.85rem; font-weight: 600; }
     </style>
 </head>
 <body>
@@ -219,14 +304,33 @@ app.get('/', (req, res) => {
             <input type="url" id="targetUrl" placeholder="https://hedef-site.com" value="https://google.com">
         </div>
 
-        <div class="grid-2">
+        <div class="grid-3">
             <div class="form-group">
                 <label for="concurrency">EŞZAMANLI İSTEK (CONCURRENCY)</label>
-                <input type="number" id="concurrency" value="10" min="1" max="100">
+                <input type="number" id="concurrency" value="10" min="1" max="500">
             </div>
             <div class="form-group">
                 <label for="delay">ARALIK SÜRESİ (MS)</label>
-                <input type="number" id="delay" value="50" min="10" max="5000">
+                <input type="number" id="delay" value="50" min="5" max="5000">
+            </div>
+            <div class="form-group">
+                <label for="timeout">ZAMAN AŞIMI (TIMEOUT MS)</label>
+                <input type="number" id="timeout" value="3000" min="100" max="30000">
+            </div>
+        </div>
+
+        <div class="grid-2">
+            <div class="form-group">
+                <label for="method">HTTP METODU</label>
+                <select id="method">
+                    <option value="GET" selected>GET</option>
+                    <option value="HEAD">HEAD</option>
+                    <option value="POST">POST</option>
+                </select>
+            </div>
+            <div class="checkbox-group" onclick="document.getElementById('uaRotation').click();">
+                <input type="checkbox" id="uaRotation" checked onclick="event.stopPropagation();">
+                <label for="uaRotation">User-Agent Rotasyonu (Anti-Bot Bypass)</label>
             </div>
         </div>
 
@@ -245,18 +349,27 @@ app.get('/', (req, res) => {
                 <div id="statRps" class="stat-val" style="color:#38bdf8">0</div>
             </div>
             <div class="stat-card">
-                <div class="stat-label">Başarılı</div>
+                <div class="stat-label">Ortalama Gecikme</div>
+                <div id="statLatency" class="stat-val" style="color:#a855f7">0 ms</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Aktif Bekleyen</div>
+                <div id="statActive" class="stat-val" style="color:#f59e0b">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Başarılı İstekler</div>
                 <div id="statSuccess" class="stat-val" style="color:#10b981">0</div>
             </div>
             <div class="stat-card">
-                <div class="stat-card-failed">
-                    <div class="stat-label">Hatalı</div>
-                    <div id="statFailed" class="stat-val" style="color:#ef4444">0</div>
-                </div>
+                <div class="stat-label">Hatalı / Zaman Aşımı</div>
+                <div id="statFailed" class="stat-val" style="color:#ef4444">0</div>
             </div>
         </div>
 
-        <div id="statusCodes" class="status-codes">HTTP Durum Kodları: Henüz veri yok</div>
+        <div class="status-codes">
+            <div class="status-codes-title">HTTP Durum Dağılımı:</div>
+            <div id="statusCodes">Henüz veri yok</div>
+        </div>
     </div>
 
     <script>
@@ -266,11 +379,14 @@ app.get('/', (req, res) => {
             const url = document.getElementById('targetUrl').value;
             const concurrency = document.getElementById('concurrency').value;
             const delay = document.getElementById('delay').value;
+            const timeout = document.getElementById('timeout').value;
+            const method = document.getElementById('method').value;
+            const uaRotation = document.getElementById('uaRotation').checked;
 
             if (!url) return alert('Lütfen geçerli bir URL girin!');
 
             try {
-                const res = await fetch(\`/api/start?url=\${encodeURIComponent(url)}&concurrency=\${concurrency}&delay=\${delay}\`);
+                const res = await fetch(\`/api/start?url=\${encodeURIComponent(url)}&concurrency=\${concurrency}&delay=\${delay}&timeout=\${timeout}&method=\${method}&uaRotation=\${uaRotation}\`);
                 const data = await res.json();
                 if (res.ok) {
                     setRunningUI(true);
@@ -308,25 +424,26 @@ app.get('/', (req, res) => {
                 
                 document.getElementById('statTotal').innerText = data.metrics.totalRequests.toLocaleString();
                 document.getElementById('statRps').innerText = data.requestsPerSecond;
+                document.getElementById('statLatency').innerText = data.avgLatencyMs + ' ms';
+                document.getElementById('statActive').innerText = data.metrics.activeRequests.toLocaleString();
                 document.getElementById('statSuccess').innerText = data.metrics.successfulRequests.toLocaleString();
                 document.getElementById('statFailed').innerText = data.metrics.failedRequests.toLocaleString();
 
-                const codes = Object.entries(data.metrics.statusCodes).map(([code, count]) => \`HTTP \${code}: \${count}\`).join(' | ');
-                document.getElementById('statusCodes').innerText = codes ? \`HTTP Durum Dağılımı: \${codes}\` : 'Henüz HTTP yanıtı alınmadı';
+                const codeEntries = Object.entries(data.metrics.statusCodes);
+                if (codeEntries.length > 0) {
+                    document.getElementById('statusCodes').innerHTML = codeEntries.map(([code, count]) => {
+                        const isSuccess = code >= 200 && code < 400;
+                        const color = isSuccess ? '#10b981' : '#ef4444';
+                        return \`<span class="code-pill" style="border-color:\${color}; color:\${color}">HTTP \${code}: \${count.toLocaleString()}</span>\`;
+                    }).join('');
+                } else {
+                    document.getElementById('statusCodes').innerText = 'Henüz HTTP yanıtı alınmadı';
+                }
 
                 if (data.isRunning) {
                     setRunningUI(true);
                     if (!updateInterval) {
                         updateInterval = setInterval(fetchStatus, 1000);
-                    }
-                    if (data.targetUrl && !document.getElementById('targetUrl').getAttribute('data-user-edited')) {
-                        document.getElementById('targetUrl').value = data.targetUrl;
-                    }
-                    if (data.concurrency && !document.getElementById('concurrency').getAttribute('data-user-edited')) {
-                        document.getElementById('concurrency').value = data.concurrency;
-                    }
-                    if (data.delay && !document.getElementById('delay').getAttribute('data-user-edited')) {
-                        document.getElementById('delay').value = data.delay;
                     }
                 } else {
                     setRunningUI(false);
@@ -355,15 +472,6 @@ app.get('/', (req, res) => {
                 btnStop.disabled = true;
             }
         }
-
-        ['targetUrl', 'concurrency', 'delay'].forEach(id => {
-            const el = document.getElementById(id);
-            if (el) {
-                el.addEventListener('input', () => {
-                    el.setAttribute('data-user-edited', 'true');
-                });
-            }
-        });
 
         fetchStatus();
     </script>
