@@ -207,7 +207,7 @@ app.get('/api/start', (req, res) => {
             intervalId = null;
             return;
         }
-        // Eğer havuzda halihazırda çok fazla yanıt bekleyen istek biriktiyse (örneğin 1000+), yenilerini yığma
+        // Eğer havuzda halihazırda çok fazla yanıt bekleyen istek biriktiyse (örneğin concurrency * 10), yenilerini yığma
         if (metrics.activeRequests > concurrency * 10) {
             return;
         }
@@ -230,6 +230,10 @@ app.get('/api/status', (req, res) => {
     const reqPerSec = durationSec > 0 ? (metrics.totalRequests / durationSec).toFixed(2) : 0;
     const avgLatency = metrics.totalRequests > 0 ? Math.round(metrics.totalLatencyMs / metrics.totalRequests) : 0;
 
+    const mem = process.memoryUsage();
+    const ramHeapMb = (mem.heapUsed / 1024 / 1024).toFixed(1);
+    const ramRssMb = (mem.rss / 1024 / 1024).toFixed(1);
+
     res.json({
         isRunning,
         targetUrl,
@@ -241,6 +245,10 @@ app.get('/api/status', (req, res) => {
         durationSeconds: durationSec,
         requestsPerSecond: reqPerSec,
         avgLatencyMs: avgLatency,
+        system: {
+            ramHeapMb,
+            ramRssMb
+        },
         metrics
     });
 });
@@ -255,10 +263,11 @@ app.get('/', (req, res) => {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>⚡ Gelişmiş Sunucu Yük Testi Kontrol Paneli</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', sans-serif; }
         body { background: #0f172a; color: #f8fafc; display: flex; justify-content: center; align-items: center; min-height: 100vh; padding: 20px; }
-        .container { background: #1e293b; width: 100%; max-width: 900px; padding: 30px; border-radius: 16px; box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5); border: 1px solid #334155; }
+        .container { background: #1e293b; width: 100%; max-width: 950px; padding: 30px; border-radius: 16px; box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5); border: 1px solid #334155; }
         .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 25px; border-bottom: 1px solid #334155; padding-bottom: 15px; }
         .title { font-size: 1.5rem; font-weight: 700; color: #38bdf8; display: flex; align-items: center; gap: 10px; }
         .badge { padding: 6px 14px; border-radius: 20px; font-size: 0.85rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }
@@ -286,11 +295,14 @@ app.get('/', (req, res) => {
         .btn-stop:hover { background: #dc2626; }
         button:disabled { opacity: 0.4; cursor: not-allowed; }
 
-        .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin-top: 30px; }
-        .stat-card { background: #0f172a; padding: 18px; border-radius: 10px; border: 1px solid #334155; text-align: center; }
-        .stat-val { font-size: 1.6rem; font-weight: 700; color: #f8fafc; margin-top: 6px; }
-        .stat-label { font-size: 0.75rem; color: #64748b; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }
+        .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin-top: 25px; }
+        .stat-card { background: #0f172a; padding: 16px; border-radius: 10px; border: 1px solid #334155; text-align: center; }
+        .stat-val { font-size: 1.5rem; font-weight: 700; color: #f8fafc; margin-top: 4px; }
+        .stat-label { font-size: 0.72rem; color: #64748b; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }
         
+        .chart-box { margin-top: 25px; background: #0f172a; padding: 20px; border-radius: 10px; border: 1px solid #334155; }
+        .chart-title { font-size: 0.85rem; font-weight: 700; text-transform: uppercase; color: #94a3b8; margin-bottom: 12px; letter-spacing: 0.5px; }
+
         .status-codes { margin-top: 20px; background: #0f172a; padding: 18px; border-radius: 10px; border: 1px solid #334155; font-size: 0.9rem; color: #cbd5e1; }
         .status-codes-title { font-size: 0.85rem; font-weight: 700; text-transform: uppercase; color: #94a3b8; margin-bottom: 10px; letter-spacing: 0.5px; }
         .code-pill { display: inline-block; background: #1e293b; border: 1px solid #334155; padding: 4px 10px; border-radius: 6px; margin-right: 8px; margin-bottom: 6px; font-size: 0.85rem; font-weight: 600; }
@@ -368,6 +380,20 @@ app.get('/', (req, res) => {
                 <div class="stat-label">Hatalı / Zaman Aşımı</div>
                 <div id="statFailed" class="stat-val" style="color:#ef4444">0</div>
             </div>
+            <div class="stat-card">
+                <div class="stat-label">Sunucu RAM Kullanımı</div>
+                <div id="statRam" class="stat-val" style="color:#ec4899">0 MB</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Test Süresi</div>
+                <div id="statDuration" class="stat-val" style="color:#cbd5e1">0s</div>
+            </div>
+        </div>
+
+        <!-- Canlı Grafik (Chart.js) -->
+        <div class="chart-box">
+            <div class="chart-title">📈 Canlı Performans Grafiği (RPS & Gecikme)</div>
+            <canvas id="liveChart" height="90"></canvas>
         </div>
 
         <div class="status-codes">
@@ -378,6 +404,71 @@ app.get('/', (req, res) => {
 
     <script>
         let updateInterval = null;
+        let chartInstance = null;
+
+        // Chart.js Kurulumu
+        function initChart() {
+            const ctx = document.getElementById('liveChart').getContext('2d');
+            chartInstance = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [
+                        {
+                            label: 'RPS (İstek/sn)',
+                            data: [],
+                            borderColor: '#38bdf8',
+                            backgroundColor: 'rgba(56, 189, 248, 0.1)',
+                            borderWidth: 2,
+                            fill: true,
+                            tension: 0.3,
+                            yAxisID: 'y'
+                        },
+                        {
+                            label: 'Gecikme (ms)',
+                            data: [],
+                            borderColor: '#a855f7',
+                            backgroundColor: 'rgba(168, 85, 247, 0.1)',
+                            borderWidth: 2,
+                            fill: true,
+                            tension: 0.3,
+                            yAxisID: 'y1'
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    animation: false,
+                    scales: {
+                        x: {
+                            ticks: { color: '#64748b', font: { size: 10 } },
+                            grid: { color: 'rgba(51, 65, 85, 0.5)' }
+                        },
+                        y: {
+                            type: 'linear',
+                            display: true,
+                            position: 'left',
+                            title: { display: true, text: 'RPS', color: '#38bdf8' },
+                            ticks: { color: '#38bdf8' },
+                            grid: { color: 'rgba(51, 65, 85, 0.5)' },
+                            beginAtZero: true
+                        },
+                        y1: {
+                            type: 'linear',
+                            display: true,
+                            position: 'right',
+                            title: { display: true, text: 'Gecikme (ms)', color: '#a855f7' },
+                            ticks: { color: '#a855f7' },
+                            grid: { drawOnChartArea: false },
+                            beginAtZero: true
+                        }
+                    },
+                    plugins: {
+                        legend: { labels: { color: '#cbd5e1' } }
+                    }
+                }
+            });
+        }
 
         async function startTest() {
             const url = document.getElementById('targetUrl').value;
@@ -432,6 +523,26 @@ app.get('/', (req, res) => {
                 document.getElementById('statActive').innerText = data.metrics.activeRequests.toLocaleString();
                 document.getElementById('statSuccess').innerText = data.metrics.successfulRequests.toLocaleString();
                 document.getElementById('statFailed').innerText = data.metrics.failedRequests.toLocaleString();
+                document.getElementById('statDuration').innerText = (data.durationSeconds || 0) + 's';
+                
+                if (data.system) {
+                    document.getElementById('statRam').innerText = data.system.ramHeapMb + ' MB';
+                }
+
+                // Grafik Güncelleme (Son 20 saniyelik zaman serisi)
+                if (chartInstance) {
+                    const timeStr = new Date().toLocaleTimeString('tr-TR', { hour12: false });
+                    chartInstance.data.labels.push(timeStr);
+                    chartInstance.data.datasets[0].data.push(parseFloat(data.requestsPerSecond) || 0);
+                    chartInstance.data.datasets[1].data.push(data.avgLatencyMs || 0);
+
+                    if (chartInstance.data.labels.length > 20) {
+                        chartInstance.data.labels.shift();
+                        chartInstance.data.datasets[0].data.shift();
+                        chartInstance.data.datasets[1].data.shift();
+                    }
+                    chartInstance.update();
+                }
 
                 const codeEntries = Object.entries(data.metrics.statusCodes);
                 if (codeEntries.length > 0) {
@@ -477,6 +588,7 @@ app.get('/', (req, res) => {
             }
         }
 
+        initChart();
         fetchStatus();
     </script>
 </body>
