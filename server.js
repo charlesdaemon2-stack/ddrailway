@@ -21,13 +21,17 @@ const USER_AGENTS = [
 
 // Durum ve Metrikler
 let isRunning = false;
-let targetUrls = ["https://google.com"];
+let targetUrls = ["http://127.0.0.1"];
 let concurrency = 10;
 let delay = 50;
 let timeoutMs = 3000;
 let durationMinutes = 0;
 let httpMethod = "GET";
 let enableUARotation = true;
+let defaultProtocol = "http";
+let customHostHeader = "";
+let ignoreSslErrors = true;
+
 let intervalId = null;
 let autoStopTimeoutId = null;
 
@@ -64,7 +68,7 @@ function getCpuPercent() {
 let httpAgent = null;
 let httpsAgent = null;
 
-function createAgents() {
+function createAgents(ignoreSsl = true) {
     httpAgent = new http.Agent({
         keepAlive: true,
         keepAliveMsecs: 3000,
@@ -75,10 +79,11 @@ function createAgents() {
         keepAlive: true,
         keepAliveMsecs: 3000,
         maxSockets: 500,
-        maxFreeSockets: 256
+        maxFreeSockets: 256,
+        rejectUnauthorized: !ignoreSsl
     });
 }
-createAgents();
+createAgents(ignoreSslErrors);
 
 function stopCurrentTest() {
     isRunning = false;
@@ -96,7 +101,7 @@ function stopCurrentTest() {
     if (httpsAgent) {
         try { httpsAgent.destroy(); } catch (err) {}
     }
-    createAgents();
+    createAgents(ignoreSslErrors);
 }
 
 function getRandomUserAgent() {
@@ -106,9 +111,30 @@ function getRandomUserAgent() {
 }
 
 function getRandomTargetUrl() {
-    if (!targetUrls || targetUrls.length === 0) return "https://google.com";
+    if (!targetUrls || targetUrls.length === 0) return "http://127.0.0.1";
     const index = Math.floor(Math.random() * targetUrls.length);
     return targetUrls[index];
+}
+
+// IP ve URL Formatını Otomatik Düzenleme & Doğrulama Fonksiyonu
+function normalizeTargetUrl(inputStr, defProto = 'http') {
+    if (!inputStr) return null;
+    let target = inputStr.trim();
+    if (!target) return null;
+
+    // Eğer http:// veya https:// eklenmemişse (örn: 192.168.1.1 veya 185.125.190.20:8080 veya example.com)
+    if (!/^https?:\/\//i.test(target)) {
+        const protoStr = (defProto || 'http').toLowerCase() === 'https' ? 'https://' : 'http://';
+        target = protoStr + target;
+    }
+
+    try {
+        const parsed = new URL(target);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+        return parsed.href;
+    } catch (e) {
+        return null;
+    }
 }
 
 function sendRequest(urlStr) {
@@ -123,29 +149,36 @@ function sendRequest(urlStr) {
         const client = isHttps ? https : http;
         const agent = isHttps ? httpsAgent : httpAgent;
 
+        const requestHeaders = {
+            'User-Agent': getRandomUserAgent(),
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Referer': parsedUrl.origin + '/',
+            'sec-ch-ua': '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Windows"',
+            'sec-fetch-dest': 'document',
+            'sec-fetch-mode': 'navigate',
+            'sec-fetch-site': 'cross-site',
+            'sec-fetch-user': '?1',
+            'upgrade-insecure-requests': '1',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive'
+        };
+
+        // Özel Host Header Tanımlandıysa Ekle (Örn: IP'ye istek atarken Virtual Host belirtmek için)
+        if (customHostHeader && customHostHeader.trim().length > 0) {
+            requestHeaders['Host'] = customHostHeader.trim();
+        }
+
         const options = {
             hostname: parsedUrl.hostname,
             port: parsedUrl.port || (isHttps ? 443 : 80),
             path: parsedUrl.pathname + parsedUrl.search,
             method: httpMethod,
             agent: agent,
-            headers: {
-                'User-Agent': getRandomUserAgent(),
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-                'Accept-Language': 'tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'Referer': parsedUrl.origin + '/',
-                'sec-ch-ua': '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
-                'sec-ch-ua-mobile': '?0',
-                'sec-ch-ua-platform': '"Windows"',
-                'sec-fetch-dest': 'document',
-                'sec-fetch-mode': 'navigate',
-                'sec-fetch-site': 'cross-site',
-                'sec-fetch-user': '?1',
-                'upgrade-insecure-requests': '1',
-                'Cache-Control': 'no-cache',
-                'Connection': 'keep-alive'
-            }
+            headers: requestHeaders
         };
 
         let handled = false;
@@ -209,16 +242,23 @@ function sendRequest(urlStr) {
         if (!isRunning) return;
         metrics.totalRequests++;
         metrics.failedRequests++;
-        metrics.statusCodes['Geçersiz URL'] = (metrics.statusCodes['Geçersiz URL'] || 0) + 1;
+        metrics.statusCodes['Geçersiz IP / URL'] = (metrics.statusCodes['Geçersiz IP / URL'] || 0) + 1;
     }
 }
 
 // API Endpoints
 app.get('/api/start', (req, res) => {
     const rawUrls = req.query.urls || req.query.url || "";
-    const parsedUrls = rawUrls.split(/[\n,]+/).map(u => u.trim()).filter(u => u.length > 0);
+    const reqDefaultProtocol = req.query.defaultProtocol || "http";
+    const reqCustomHost = req.query.customHost || "";
+    const reqIgnoreSsl = req.query.ignoreSsl !== 'false';
 
-    if (parsedUrls.length === 0) return res.status(400).json({ error: "En az bir geçerli hedef URL gerekli!" });
+    const parsedUrls = rawUrls
+        .split(/[\n,]+/)
+        .map(u => normalizeTargetUrl(u, reqDefaultProtocol))
+        .filter(Boolean);
+
+    if (parsedUrls.length === 0) return res.status(400).json({ error: "En az bir geçerli hedef IP adresi veya URL gerekli!" });
 
     const reqConcurrency = parseInt(req.query.concurrency) || 10;
     const reqDelay = parseInt(req.query.delay) || 50;
@@ -227,6 +267,7 @@ app.get('/api/start', (req, res) => {
     const reqMethod = (req.query.method || 'GET').toUpperCase();
     const reqUARotation = req.query.uaRotation === 'true';
 
+    ignoreSslErrors = reqIgnoreSsl;
     stopCurrentTest();
 
     targetUrls = parsedUrls;
@@ -236,6 +277,8 @@ app.get('/api/start', (req, res) => {
     durationMinutes = reqDuration > 0 ? reqDuration : 0;
     httpMethod = ['GET', 'HEAD', 'POST'].includes(reqMethod) ? reqMethod : 'GET';
     enableUARotation = reqUARotation;
+    defaultProtocol = reqDefaultProtocol;
+    customHostHeader = reqCustomHost;
     isRunning = true;
 
     metrics = {
@@ -275,7 +318,19 @@ app.get('/api/start', (req, res) => {
         }, autoStopMs);
     }
 
-    res.json({ message: "Test başlatıldı", targetUrls, concurrency, delay, timeoutMs, durationMinutes, httpMethod, enableUARotation });
+    res.json({
+        message: "Test başlatıldı",
+        targetUrls,
+        concurrency,
+        delay,
+        timeoutMs,
+        durationMinutes,
+        httpMethod,
+        enableUARotation,
+        defaultProtocol,
+        customHostHeader,
+        ignoreSslErrors
+    });
 });
 
 app.get('/api/stop', (req, res) => {
@@ -306,6 +361,9 @@ app.get('/api/status', (req, res) => {
         durationMinutes,
         httpMethod,
         enableUARotation,
+        defaultProtocol,
+        customHostHeader,
+        ignoreSslErrors,
         durationSeconds: durationSec,
         requestsPerSecond: reqPerSec,
         avgLatencyMs: avgLatency,
@@ -328,13 +386,13 @@ app.get('/', (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>⚡ Gelişmiş Sunucu Yük Testi Kontrol Paneli</title>
+    <title>⚡ Gelişmiş Sunucu Yük Testi Kontrol Paneli (IP & URL)</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', sans-serif; }
         body { background: #0f172a; color: #f8fafc; display: flex; justify-content: center; align-items: center; min-height: 100vh; padding: 20px; }
-        .container { background: #1e293b; width: 100%; max-width: 950px; padding: 30px; border-radius: 16px; box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5); border: 1px solid #334155; }
+        .container { background: #1e293b; width: 100%; max-width: 980px; padding: 30px; border-radius: 16px; box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5); border: 1px solid #334155; }
         .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 25px; border-bottom: 1px solid #334155; padding-bottom: 15px; }
         .title { font-size: 1.5rem; font-weight: 700; color: #38bdf8; display: flex; align-items: center; gap: 10px; }
         .badge { padding: 6px 14px; border-radius: 20px; font-size: 0.85rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }
@@ -344,15 +402,17 @@ app.get('/', (req, res) => {
         
         .form-group { margin-bottom: 20px; }
         label { display: block; margin-bottom: 8px; font-size: 0.85rem; color: #94a3b8; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
-        input[type="url"], input[type="number"], select, textarea { width: 100%; padding: 12px 16px; background: #0f172a; border: 1px solid #334155; border-radius: 8px; color: #fff; font-size: 0.95rem; outline: none; transition: 0.2s; resize: vertical; }
+        .hint { font-size: 0.75rem; color: #64748b; margin-top: 4px; display: block; font-weight: 400; text-transform: none; }
+        input[type="text"], input[type="url"], input[type="number"], select, textarea { width: 100%; padding: 12px 16px; background: #0f172a; border: 1px solid #334155; border-radius: 8px; color: #fff; font-size: 0.95rem; outline: none; transition: 0.2s; resize: vertical; }
         input:focus, select:focus, textarea:focus { border-color: #38bdf8; box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.2); }
         
         .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; }
+        .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; }
         .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
         
-        .checkbox-group { display: flex; align-items: center; gap: 10px; background: #0f172a; padding: 12px 16px; border-radius: 8px; border: 1px solid #334155; margin-top: 24px; cursor: pointer; }
+        .checkbox-group { display: flex; align-items: center; gap: 10px; background: #0f172a; padding: 12px 16px; border-radius: 8px; border: 1px solid #334155; cursor: pointer; user-select: none; }
         .checkbox-group input { width: 18px; height: 18px; cursor: pointer; accent-color: #38bdf8; }
-        .checkbox-group label { margin: 0; cursor: pointer; font-size: 0.9rem; text-transform: none; color: #e2e8f0; }
+        .checkbox-group label { margin: 0; cursor: pointer; font-size: 0.85rem; text-transform: none; color: #e2e8f0; font-weight: 500; }
 
         .btn-group { display: flex; gap: 15px; margin-top: 25px; }
         button { flex: 1; padding: 14px; border: none; border-radius: 8px; font-size: 1rem; font-weight: 700; cursor: pointer; transition: 0.2s; }
@@ -378,13 +438,28 @@ app.get('/', (req, res) => {
 <body>
     <div class="container">
         <div class="header">
-            <div class="title">⚡ Yük Testi Kontrol Paneli</div>
+            <div class="title">⚡ Yük Testi Kontrol Paneli (IP & Domain)</div>
             <div id="statusBadge" class="badge badge-idle">BEKLEMEDE</div>
         </div>
 
         <div class="form-group">
-            <label for="targetUrls">HEDEF WEB SİTELERİ / URL LİSTESİ (HER SATIRA BİR URL)</label>
-            <textarea id="targetUrls" rows="3" placeholder="https://hedef-site1.com&#10;https://hedef-site2.com/api">https://google.com</textarea>
+            <label for="targetUrls">HEDEF İP ADRESLERİ / WEB SİTELERİ (HER SATIRA BİR ADRES)</label>
+            <textarea id="targetUrls" rows="3" placeholder="192.168.1.1&#10;185.125.190.20:8080&#10;192.168.1.50/api/v1&#10;https://google.com">192.168.1.1</textarea>
+            <span class="hint">💡 İpucu: Doğrudan IP adresi (örn: 192.168.1.1 veya 185.125.190.20:8080) ya da tam URL girebilirsiniz. Otomatik olarak HTTP/HTTPS eklenecektir.</span>
+        </div>
+
+        <div class="grid-2" style="margin-bottom: 15px;">
+            <div class="form-group" style="margin-bottom: 0;">
+                <label for="defaultProtocol">VARSAYILAN PROTOKOL (PROTOKOLSÜZ İP'LER İÇİN)</label>
+                <select id="defaultProtocol">
+                    <option value="http" selected>HTTP (http://)</option>
+                    <option value="https">HTTPS (https://)</option>
+                </select>
+            </div>
+            <div class="form-group" style="margin-bottom: 0;">
+                <label for="customHost">ÖZEL HOST HEADER (OPSİYONEL)</label>
+                <input type="text" id="customHost" placeholder="Örn: siteadi.com (Sadece IP testlerinde sanal host için)">
+            </div>
         </div>
 
         <div class="grid-4">
@@ -406,8 +481,8 @@ app.get('/', (req, res) => {
             </div>
         </div>
 
-        <div class="grid-2">
-            <div class="form-group">
+        <div class="grid-3" style="align-items: center;">
+            <div class="form-group" style="margin-bottom: 0;">
                 <label for="method">HTTP METODU</label>
                 <select id="method">
                     <option value="GET" selected>GET</option>
@@ -418,6 +493,10 @@ app.get('/', (req, res) => {
             <div class="checkbox-group" onclick="document.getElementById('uaRotation').click();">
                 <input type="checkbox" id="uaRotation" checked onclick="event.stopPropagation();">
                 <label for="uaRotation">User-Agent Rotasyonu (Anti-Bot Bypass)</label>
+            </div>
+            <div class="checkbox-group" onclick="document.getElementById('ignoreSsl').click();">
+                <input type="checkbox" id="ignoreSsl" checked onclick="event.stopPropagation();">
+                <label for="ignoreSsl">SSL Hatalarını Yoksay (Direct IP / Self-Signed)</label>
             </div>
         </div>
 
@@ -555,17 +634,33 @@ app.get('/', (req, res) => {
 
         async function startTest() {
             const urls = document.getElementById('targetUrls').value;
+            const defaultProtocol = document.getElementById('defaultProtocol').value;
+            const customHost = document.getElementById('customHost').value;
             const concurrency = document.getElementById('concurrency').value;
             const delay = document.getElementById('delay').value;
             const timeout = document.getElementById('timeout').value;
             const duration = document.getElementById('duration').value;
             const method = document.getElementById('method').value;
             const uaRotation = document.getElementById('uaRotation').checked;
+            const ignoreSsl = document.getElementById('ignoreSsl').checked;
 
-            if (!urls.trim()) return alert('Lütfen en az bir geçerli URL girin!');
+            if (!urls.trim()) return alert('Lütfen en az bir geçerli IP adresi veya URL girin!');
 
             try {
-                const res = await fetch(\`/api/start?urls=\${encodeURIComponent(urls)}&concurrency=\${concurrency}&delay=\${delay}&timeout=\${timeout}&duration=\${duration}&method=\${method}&uaRotation=\${uaRotation}\`);
+                const queryParams = new URLSearchParams({
+                    urls,
+                    defaultProtocol,
+                    customHost,
+                    concurrency,
+                    delay,
+                    timeout,
+                    duration,
+                    method,
+                    uaRotation,
+                    ignoreSsl
+                });
+
+                const res = await fetch(\`/api/start?\${queryParams.toString()}\`);
                 const data = await res.json();
                 if (res.ok) {
                     setRunningUI(true);
